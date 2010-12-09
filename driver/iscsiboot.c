@@ -29,6 +29,7 @@
 #include <wdmsec.h>
 #include <iscsicfg.h>
 #include "ibft.h"
+#include "stdlib.h"
 
 /** Tag to use for memory allocation */
 #define ISCSIBOOT_POOL_TAG 'bcsi'
@@ -701,13 +702,15 @@ static NTSTATUS fetch_netcfginstanceid ( PDEVICE_OBJECT pdo,
  * @ret ntstatus	NT status
  */
 static NTSTATUS store_ipv4_parameter_sz ( HANDLE reg_key, LPCWSTR value_name,
-					  ULONG ipaddr ) {
+					  ULONG ipaddr, ULONG ipaddr2 ) {
 	WCHAR buf[16];
 	LPWSTR value;
 
-	if ( ipaddr ) {
-		RtlStringCbPrintfW ( buf, sizeof ( buf ),
-				     L"%S", inet_ntoa ( ipaddr ) );
+	if ( ipaddr) {
+		if(ipaddr2)
+			RtlStringCbPrintfW ( buf, sizeof ( buf ), L"%S,%S", inet_ntoa ( ipaddr ), inet_ntoa(ipaddr2) );
+		else
+			RtlStringCbPrintfW ( buf, sizeof ( buf ), L"%S", inet_ntoa ( ipaddr ));
 		value = buf;
 	} else {
 		value = L"";
@@ -749,7 +752,8 @@ static NTSTATUS store_ipv4_parameter_multi_sz ( HANDLE reg_key,
  * @ret ntstatus	NT status
  */
 static NTSTATUS store_tcpip_parameters ( PIBFT_NIC nic,
-					 LPCWSTR netcfginstanceid ) {
+					 LPCWSTR netcfginstanceid ) 
+{
 	LPCWSTR key_name_prefix = ( L"\\Registry\\Machine\\SYSTEM\\"
 				    L"CurrentControlSet\\Services\\"
 				    L"Tcpip\\Parameters\\Interfaces\\" );
@@ -794,17 +798,23 @@ static NTSTATUS store_tcpip_parameters ( PIBFT_NIC nic,
 		goto err_reg_store;
 
 	/* Store default gateway */
-	status = store_ipv4_parameter_multi_sz ( reg_key, L"DefaultGateway",
-						 nic->gateway.in );
-	if ( ! NT_SUCCESS ( status ) )
-		goto err_reg_store;
+	// don't fix gw for win7 if the gateway is null * modified by yaoer@youngzsoft.com from CCBoot
+	if(nic->gateway.in)
+	{
+		status = store_ipv4_parameter_multi_sz ( reg_key, L"DefaultGateway",
+			nic->gateway.in );
+		if ( ! NT_SUCCESS ( status ) )
+			goto err_reg_store;
+	}
 
 	/* Store DNS servers */
-	status = store_ipv4_parameter_sz ( reg_key, L"NameServer",
-					   nic->dns[0].in );
-	if ( ! NT_SUCCESS ( status ) )
-		goto err_reg_store;
-
+	if(nic->dns[0].in)
+	{
+		status = store_ipv4_parameter_sz ( reg_key, L"NameServer",
+			nic->dns[0].in, nic->dns[1].in );
+		if ( ! NT_SUCCESS ( status ) )
+			goto err_reg_store;
+	}
 	/* Disable DHCP */
 	status = reg_store_dword ( reg_key, L"EnableDHCP", 0 );
 	if ( ! NT_SUCCESS ( status ) )
@@ -812,12 +822,67 @@ static NTSTATUS store_tcpip_parameters ( PIBFT_NIC nic,
 
  err_reg_store:
 	reg_close ( reg_key );
+
  err_reg_open:
 	ExFreePool ( key_name );
  err_exallocatepoolwithtag:
+
 	return status;
 }
 
+/**
+ * Store Computer Name in registry
+ *
+ * Added by Yaoer (yaoer@youngzsoft.com) Feb 24, 2009 from CCBoot
+ *
+ */
+static NTSTATUS set_computer_name(PIBFT_TABLE ibft, PIBFT_NIC nic)
+{
+	WCHAR buf[512];
+	HANDLE reg_key;
+	LPSTR computername = NULL;
+	
+	computername = ibft_string ( ibft, &nic->hostname );
+
+	// if no computername, return
+	if(computername[0] == 0)
+		return 0;
+
+	RtlStringCbPrintfW ( buf, sizeof ( buf ),   L"%S", computername );
+
+	if(reg_open(L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Control\\ComputerName\\ComputerName", &reg_key) >= 0)
+	{
+		reg_store_sz ( reg_key, L"ComputerName", buf);
+		reg_close(reg_key);
+	}
+
+	if(reg_open(L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Eventlog", &reg_key) >= 0)
+	{
+		reg_store_sz ( reg_key, L"ComputerName", buf);
+		reg_close(reg_key);
+	}
+
+	if(reg_open(L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Control\\ComputerName\\ComputerName", &reg_key) >= 0)
+	{
+		reg_store_sz ( reg_key, L"ComputerName", buf);
+		reg_close(reg_key);
+	}
+
+	if(reg_open(L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters", &reg_key) >= 0)
+	{
+		reg_store_sz ( reg_key, L"NV Hostname", buf);
+		reg_close(reg_key);
+	}
+
+	if(reg_open(L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters", &reg_key) >= 0)
+	{
+		reg_store_sz ( reg_key, L"Hostname", buf);
+		reg_close(reg_key);
+	}
+
+	return 0;
+
+};	
 /**
  * Try to configure NIC from iBFT NIC structure
  *
@@ -904,6 +969,7 @@ static VOID parse_ibft_nic ( PIBFT_TABLE ibft, PIBFT_NIC nic ) {
 	UNICODE_STRING u_symlink;
 	NTSTATUS status;
 
+
 	/* Dump structure information */
 	DbgPrint ( "Found iBFT NIC %d:\n", header->index );
 	DbgPrint ( "  Flags = %#02x%s%s\n", header->flags,
@@ -917,11 +983,13 @@ static VOID parse_ibft_nic ( PIBFT_TABLE ibft, PIBFT_NIC nic ) {
 		return;
 	DbgPrint ( "  IP = %s/%d\n", ibft_ipaddr ( &nic->ip_address ),
 		   nic->subnet_mask_prefix );
+
 	DbgPrint ( "  Origin = %d\n", nic->origin );
 	DbgPrint ( "  Gateway = %s\n", ibft_ipaddr ( &nic->gateway ) );
 	DbgPrint ( "  DNS = %s", ibft_ipaddr ( &nic->dns[0] ) );
 	DbgPrint ( ", %s\n", ibft_ipaddr ( &nic->dns[1] ) );
 	DbgPrint ( "  DHCP = %s\n", ibft_ipaddr ( &nic->dhcp ) );
+
 	DbgPrint ( "  VLAN = %04x\n", nic->vlan );
 	DbgPrint ( "  MAC = %02x:%02x:%02x:%02x:%02x:%02x\n",
 		   nic->mac_address[0], nic->mac_address[1],
@@ -948,6 +1016,9 @@ static VOID parse_ibft_nic ( PIBFT_TABLE ibft, PIBFT_NIC nic ) {
 	      symlink += ( ( u_symlink.Length / sizeof ( *symlink ) ) + 1 ) ) {
 		try_configure_nic ( nic, &u_symlink );
 	}
+
+    /* Set computer name by DHCP hostname */
+    set_computer_name(ibft, nic);	
 
 	/* Free object list */
 	ExFreePool ( symlinks );
@@ -977,6 +1048,7 @@ static VOID parse_ibft_target ( PIBFT_TABLE ibft, PIBFT_TARGET target ) {
 		return;
 	DbgPrint ( "  IP = %s\n",
 		   ibft_ipaddr ( &target->ip_address ) );
+
 	DbgPrint ( "  Port = %d\n", target->socket );
 	DbgPrint ( "  LUN = %04x-%04x-%04x-%04x\n",
 		   ( ( target->boot_lun >> 48 ) & 0xffff ),
